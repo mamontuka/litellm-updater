@@ -15,11 +15,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org>.
 
-# LiteLLM Auto-Update Script
-# Environment: Linux (Debian/Ubuntu), venv, systemd service
-# Скрипт автоматического ремонта LiteLLM (Auto-Repair Prisma Migrations)
-# Назначение: Автоматически находит и удаляет зависшие миграции, чистит БД и перезапускает сервис.
-#
+# LiteLLM Auto-Repair Script (Auto-Fix Prisma Migrations)
+# Назначение: Автоматически находит и удаляет зависшие миграции, чистит БД от ошибок и перезапускает сервис.
+# Используйте этот скрипт, если при запуске возникает ошибка P3018 или P3009.
+
 # **НАСТРОЙКИ**
 VENV_PATH="/root/ai/core/servers/litellm-venv"
 SERVICE_NAME="ai-litellm"
@@ -42,8 +41,8 @@ systemctl stop $SERVICE_NAME || echo "⚠️  Служба уже останов
 # --- ШАГ 2: Поиск и удаление проблемных файлов миграций ---
 echo "[2/5] Поиск и удаление 'зависших' файлов миграций..."
 
-# Ищем файлы/папки, содержащие дату в формате YYYYMMDDHHMMSS или имена, похожие на problematic migration
-# Мы ищем всё, что похоже на миграцию, которая могла вызвать P3018
+# Ищем файлы/папки, содержащие подозрительные даты (YYYYMMDD...) или специфичные имена проблемных миграций
+# Мы ищем в venv, так как там хранятся зависимости.
 PROBLEM_FILES=$(find "$VENV_PATH" -type f -o -type d \( -name "*20260331*" -o -name "*add_prompt_environment*" -o -name "*baseline_diff_failed*" \) 2>/dev/null)
 
 if [ -n "$PROBLEM_FILES" ]; then
@@ -51,6 +50,7 @@ if [ -n "$PROBLEM_FILES" ]; then
     echo "$PROBLEM_FILES"
     
     # Удаляем найденные объекты (рекурсивно для папок)
+    # Используем --no-run-if-empty для защиты от пустого вывода
     echo "$PROBLEM_FILES" | xargs rm -rffv
     
     echo "✅ Проблемные файлы удалены."
@@ -63,13 +63,8 @@ echo "[3/5] Очистка базы данных от записей о неуд
 
 export PGPASSWORD="$DB_PASS"
 
-# Удаляем ВСЕ записи, которые помечены как failed или имеют статус ошибки, 
-# либо просто все записи с датой, которая может быть старой/проблемной.
-# Здесь мы удаляем конкретную проблемную миграцию, если она осталась в БД.
+# Удаляем записи о конкретной проблемной миграции из истории Prisma
 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "DELETE FROM _prisma_migrations WHERE migration_name LIKE '%20260331%';"
-
-# Также можно удалить все записи, если нужно полностью сбросить историю миграций (ОСТОРОЖНО!)
-# psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "TRUNCATE TABLE _prisma_migrations RESTART IDENTITY;"
 
 if [ $? -eq 0 ]; then
     echo "✅ База данных очищена от старых записей."
@@ -79,15 +74,16 @@ else
 fi
 unset PGPASSWORD
 
-# --- ШАГ 4: Проверка схемы и генерация (опционально) ---
+# --- ШАГ 4: Проверка схемы и генерация ---
 echo "[4/5] Проверка схемы Prisma..."
 source "$VENV_PATH/bin/activate"
 SCHEMA_PATH=$(python3 -c "import os, litellm; print(os.path.join(os.path.dirname(litellm.__file__), 'proxy/schema.prisma'))")
 echo "Схема найдена: $SCHEMA_PATH"
 
 # Применяем db push, чтобы убедиться, что база синхронизирована со схемой
+# --force-reset используется только если есть критические ошибки, иначе стандартный push
 export DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-prisma db push --schema="$SCHEMA_PATH" --accept-data-loss --force-reset 2>/dev/null || prisma db push --schema="$SCHEMA_PATH" --accept-data-loss
+prisma db push --schema="$SCHEMA_PATH" --accept-data-loss
 prisma generate --schema="$SCHEMA_PATH"
 echo "✅ Схема проверена и обновлена."
 
