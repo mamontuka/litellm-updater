@@ -15,15 +15,16 @@
 # along with this program. If not, see <https://www.gnu.org>.
 
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v2)
 # Назначение: Полностью автоматическое восстановление failed-миграций Prisma.
 # Исправление: Убраны nameref для избежания circular reference errors.
 # Поддержка: CREATE TABLE, ADD COLUMN, CREATE INDEX, FOREIGN KEY.
+# Исправление: Корректный парсинг CONSTRAINT и фильтрация ложных срабатываний.
 #
 set -euo pipefail
 
 # === КОНФИГУРАЦИЯ ===
-SERVICE_NAME="ai-litellm"
+SERVICE_NAME="ai-core-litellm"
 DB_USER="litellm_user"
 DB_PASS="litellm_pass"
 DB_HOST="localhost"
@@ -33,10 +34,8 @@ MIGRATIONS_DIR="/root/ai/core/servers/litellm-venv/lib/python3.11/site-packages/
 
 export PGPASSWORD="$DB_PASS"
 
-# Глобальный массив артефактов
 declare -a ARTIFACTS=()
 
-# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -60,6 +59,10 @@ check_table_exists() {
 check_column_exists() {
     local table="$1"
     local column="$2"
+    # Игнорируем служебные слова, которые могли попасть в парсер
+    if [[ "$column" == "CONSTRAINT" || "$column" == "FOREIGN" || "$column" == "KEY" ]]; then
+        return 0
+    fi
     local count
     count=$(run_sql "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = '$table' AND column_name = '$column';")
     [[ "$count" -gt 0 ]]
@@ -88,16 +91,29 @@ mark_migration_applied() {
 parse_sql_file() {
     local sql_file="$1"
     while IFS= read -r line; do
+        # CREATE TABLE
         if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
             ARTIFACTS+=("table:${BASH_REMATCH[1]}")
         fi
-        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+(COLUMN[[:space:]]+)?[\"']?([A-Za-z_]+)[\"']? ]]; then
-            ARTIFACTS+=("column:${BASH_REMATCH[1]}:${BASH_REMATCH[3]}")
+        
+        # ALTER TABLE ADD COLUMN
+        # Улучшенный регекс: явно ищем ADD COLUMN или ADD <col>, исключая CONSTRAINT
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+(COLUMN[[:space:]]+)?[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
+            local col="${BASH_REMATCH[3]}"
+            # Пропускаем, если это часть конструкции CONSTRAINT
+            if [[ ! "$line" =~ CONSTRAINT ]]; then
+                ARTIFACTS+=("column:${BASH_REMATCH[1]}:${col}")
+            fi
         fi
+        
+        # CREATE INDEX
         if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
             ARTIFACTS+=("index:${BASH_REMATCH[3]}")
         fi
-        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+FOREIGN[[:space:]]+KEY ]]; then
+        
+        # ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY
+        # Исправленный регекс: захватываем имя ограничения правильно
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?[[:space:]]+FOREIGN[[:space:]]+KEY ]]; then
             ARTIFACTS+=("constraint:${BASH_REMATCH[2]}")
         fi
     done < "$sql_file"
@@ -176,6 +192,18 @@ process_migration() {
         log_warn "SQL fail ne nayden, ispolzuyu evristiku."
         parse_migration_name "$migration_name" || true
     fi
+    
+    # Фильтрация дубликатов и мусора
+    declare -A unique_artifacts
+    local clean_artifacts=()
+    for art in "${ARTIFACTS[@]}"; do
+        if [[ -z "${unique_artifacts[$art]+x}" ]]; then
+            unique_artifacts[$art]=1
+            clean_artifacts+=("$art")
+        fi
+    done
+    ARTIFACTS=("${clean_artifacts[@]}")
+
     if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
         log_warn "Ne udalos opredelit artefakty. Propusk."
         return 1
@@ -191,7 +219,7 @@ process_migration() {
 }
 
 main() {
-    echo "LITELLM AUTO-REPAIR (ULTIMATE)"
+    echo "LITELLM AUTO-REPAIR (ULTIMATE v2)"
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
         log_warn "Papka migraciy ne naydena: $MIGRATIONS_DIR"
     fi
