@@ -37,6 +37,35 @@ def extract_port(api_base: str) -> str:
     match = re.search(r":(\d+)(?:/|$)", str(api_base))
     return match.group(1) if match else "0000"
 
+def force_terminate_connections():
+    """🔪 [0/3] FORCE TERMINATE: Kill all connections to the database"""
+    print("🔪 [0/3] === TERMINATING ACTIVE CONNECTIONS ===")
+    try:
+        print("   🔌 Connecting to PostgreSQL (system db)...")
+        # Connect to 'postgres' db to safely terminate connections to 'litellm_db'
+        conn = psycopg2.connect(DB_URL.replace("/litellm_db", "/postgres"))
+        conn.autocommit = True
+        cur = conn.cursor()
+        print("   ✅ Connection established.")
+
+        print("   🚫 Terminating all backends connected to 'litellm_db'...")
+        cur.execute('''
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = 'litellm_db'
+            AND pid <> pg_backend_pid();
+        ''')
+        terminated = cur.rowcount
+        print(f"   💀 Terminated {terminated} active connection(s).")
+
+        cur.close()
+        conn.close()
+        print("   🔌 Connection closed.")
+        print(f"✅ [0/3] Connections terminated. Ready for cleanup.")
+    except Exception as e:
+        print(f"⚠️ [0/3] WARNING: Could not terminate connections: {e}")
+        print("   Proceeding anyway, but TRUNCATE may fail if locks exist.")
+
 def hard_reset_db():
     """🧨 [1/3] RADICAL CLEANUP: Clear table"""
     print("🧨 [1/3] === STARTING DATABASE CLEANUP ===")
@@ -180,6 +209,8 @@ if __name__ == "__main__":
     print("🦌 LITELLM DB CONFIG PUSHER")
     print("=" * 60)
 
+    force_terminate_connections()
+    time.sleep(0.5)
     hard_reset_db()
     time.sleep(0.5)
     push_models_directly()
@@ -187,6 +218,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60)
     print("✨ DONE! All stages completed successfully.")
+    print("   • Connections terminated.")
     print("   • Database cleared and verified.")
     print("   • Models written strictly in order.")
     print(f"   • created_by = '{DB_USER_TAG}'.")
