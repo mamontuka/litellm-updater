@@ -15,15 +15,17 @@
 # along with this program. If not, see <https://www.gnu.org>.
 
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v2)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v3)
 # Назначение: Полностью автоматическое восстановление failed-миграций Prisma.
 # Исправление: Убраны nameref для избежания circular reference errors.
 # Поддержка: CREATE TABLE, ADD COLUMN, CREATE INDEX, FOREIGN KEY.
 # Исправление: Корректный парсинг CONSTRAINT и фильтрация ложных срабатываний.
-#
+# Исправление: Корректные регексы для кавычек и пробелов
+
+#!/bin/bash
+
 set -euo pipefail
 
-# === КОНФИГУРАЦИЯ ===
 SERVICE_NAME="ai-core-litellm"
 DB_USER="litellm_user"
 DB_PASS="litellm_pass"
@@ -31,7 +33,6 @@ DB_HOST="localhost"
 DB_PORT="5432"
 DB_NAME="litellm_db"
 MIGRATIONS_DIR="/root/ai/core/servers/litellm-venv/lib/python3.11/site-packages/litellm_proxy_extras/migrations"
-
 export PGPASSWORD="$DB_PASS"
 
 declare -a ARTIFACTS=()
@@ -59,7 +60,6 @@ check_table_exists() {
 check_column_exists() {
     local table="$1"
     local column="$2"
-    # Игнорируем служебные слова, которые могли попасть в парсер
     if [[ "$column" == "CONSTRAINT" || "$column" == "FOREIGN" || "$column" == "KEY" ]]; then
         return 0
     fi
@@ -90,55 +90,83 @@ mark_migration_applied() {
 
 parse_sql_file() {
     local sql_file="$1"
-    while IFS= read -r line; do
-        # CREATE TABLE
-        if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
+    local line tbl col idx constraint_name
+    
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Пропускаем комментарии и пустые строки
+        [[ "$line" =~ ^[[:space:]]*-- ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        set +u
+        # CREATE TABLE (с поддержкой кавычек)
+        if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("table:${BASH_REMATCH[1]}")
         fi
         
-        # ALTER TABLE ADD COLUMN
-        # Улучшенный регекс: явно ищем ADD COLUMN или ADD <col>, исключая CONSTRAINT
-        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+(COLUMN[[:space:]]+)?[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
-            local col="${BASH_REMATCH[3]}"
-            # Пропускаем, если это часть конструкции CONSTRAINT
-            if [[ ! "$line" =~ CONSTRAINT ]]; then
-                ARTIFACTS+=("column:${BASH_REMATCH[1]}:${col}")
+        # ALTER TABLE ADD COLUMN (исправленный регекс)
+        # Кавычки: \"? вместо [\"\'"]?
+        # Пробелы: [[:space:]]+ для поддержки множественных пробелов
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+COLUMN[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            tbl="${BASH_REMATCH[1]}"
+            col="${BASH_REMATCH[2]}"
+            if [[ -n "$tbl" && -n "$col" ]]; then
+                ARTIFACTS+=("column:${tbl}:${col}")
             fi
         fi
         
         # CREATE INDEX
-        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']? ]]; then
-            ARTIFACTS+=("index:${BASH_REMATCH[3]}")
+        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            idx="${BASH_REMATCH[3]}"
+            if [[ -n "$idx" ]]; then
+                ARTIFACTS+=("index:${idx}")
+            fi
         fi
         
-        # ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY
-        # Исправленный регекс: захватываем имя ограничения правильно
-        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+[\"']?([A-Za-z_]+)[\"']?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?[[:space:]]+FOREIGN[[:space:]]+KEY ]]; then
-            ARTIFACTS+=("constraint:${BASH_REMATCH[2]}")
+        # ALTER TABLE ADD CONSTRAINT
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            constraint_name="${BASH_REMATCH[2]}"
+            if [[ -n "$constraint_name" ]]; then
+                ARTIFACTS+=("constraint:${constraint_name}")
+            fi
         fi
+        set -u
     done < "$sql_file"
 }
 
 parse_migration_name() {
     local name="$1"
-    if [[ "$name" =~ add_([a-z_]+)_([a-z_]+)$ ]]; then
-        local tbl_raw="${BASH_REMATCH[1]}"
-        local col="${BASH_REMATCH[2]}"
-        local tbl=$(echo "$tbl_raw" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS='')
+    local col tbl_raw tbl
+    
+    set +u
+    if [[ "$name" =~ add_([a-z_]+)_to_([a-z_]+)_table$ ]]; then
+        col="${BASH_REMATCH[1]}"
+        tbl_raw="${BASH_REMATCH[2]}"
+        tbl=$(echo "$tbl_raw" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS='')
         ARTIFACTS+=("column:LiteLLM_${tbl}:${col}")
+        set -u
         return 0
-    fi
-    if [[ "$name" =~ add_([a-z_]+)_tables$ ]]; then
-        local tbl_raw="${BASH_REMATCH[1]}"
-        local tbl=$(echo "$tbl_raw" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS='')
+    elif [[ "$name" =~ add_([a-z_]+)_([a-z_]+)$ ]]; then
+        tbl_raw="${BASH_REMATCH[1]}"
+        col="${BASH_REMATCH[2]}"
+        tbl=$(echo "$tbl_raw" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS='')
+        ARTIFACTS+=("column:LiteLLM_${tbl}:${col}")
+        set -u
+        return 0
+    elif [[ "$name" =~ add_([a-z_]+)_tables$ ]]; then
+        tbl_raw="${BASH_REMATCH[1]}"
+        tbl=$(echo "$tbl_raw" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS='')
         ARTIFACTS+=("table:LiteLLM_${tbl}")
+        set -u
         return 0
     fi
+    set -u
     return 1
 }
 
 verify_artifacts() {
     local all_ok=true
+    local art type arg1 arg2
+    
     for art in "${ARTIFACTS[@]}"; do
         IFS=':' read -r type arg1 arg2 <<< "$art"
         case "$type" in
@@ -183,19 +211,21 @@ process_migration() {
     local migration_name="$1"
     local migration_dir="$MIGRATIONS_DIR/$migration_name"
     local sql_file="$migration_dir/migration.sql"
+    
     log_info "Analiz migracii: $migration_name"
     ARTIFACTS=()
+    
     if [[ -f "$sql_file" ]]; then
         log_info "Parsing SQL file..."
         parse_sql_file "$sql_file"
     else
-        log_warn "SQL fail ne nayden, ispolzuyu evristiku."
+        log_warn "SQL fail ne nayden, ispolzuyu evristiku po imeni."
         parse_migration_name "$migration_name" || true
     fi
     
-    # Фильтрация дубликатов и мусора
     declare -A unique_artifacts
     local clean_artifacts=()
+    local art
     for art in "${ARTIFACTS[@]}"; do
         if [[ -z "${unique_artifacts[$art]+x}" ]]; then
             unique_artifacts[$art]=1
@@ -203,12 +233,14 @@ process_migration() {
         fi
     done
     ARTIFACTS=("${clean_artifacts[@]}")
-
+    
     if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
         log_warn "Ne udalos opredelit artefakty. Propusk."
         return 1
     fi
+    
     log_info "Naydeno artefaktov: ${#ARTIFACTS[@]}"
+    
     if verify_artifacts; then
         mark_migration_applied "$migration_name"
         return 0
@@ -219,24 +251,32 @@ process_migration() {
 }
 
 main() {
-    echo "LITELLM AUTO-REPAIR (ULTIMATE v2)"
+    echo "LITELLM AUTO-REPAIR (ULTIMATE v5)"
+    
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
         log_warn "Papka migraciy ne naydena: $MIGRATIONS_DIR"
+        exit 1
     fi
+    
     log_info "Poisk failed-migraciy..."
     local migrations
     migrations=$(run_sql "SELECT DISTINCT migration_name FROM _prisma_migrations WHERE rolled_back_at IS NOT NULL OR finished_at IS NULL;")
+    
     if [[ -z "$migrations" ]]; then
         log_info "Net failed-migraciy. Sostoyanie korrektno."
         exit 0
     fi
+    
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         log_info "Ostanovka $SERVICE_NAME..."
         systemctl stop "$SERVICE_NAME"
         sleep 2
     fi
+    
     local resolved=0
     local skipped=0
+    local migration
+    
     while IFS= read -r migration; do
         [[ -z "$migration" ]] && continue
         echo "-------------------------------------------"
@@ -246,12 +286,17 @@ main() {
             skipped=$((skipped + 1))
         fi
     done <<< "$migrations"
+    
     echo "-------------------------------------------"
     log_info "Itog: $resolved ispravleno, $skipped propuscheno."
+    
     log_info "Zapusk $SERVICE_NAME..."
     systemctl start "$SERVICE_NAME"
+    
     echo "SKRIPT ZAVYORSHEN"
     unset PGPASSWORD
 }
 
 main "$@"
+SCRIPT_EOF
+chmod +x ./litellm-auto-repair.sh
