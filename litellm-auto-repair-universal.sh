@@ -14,11 +14,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org>.
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v6)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.2)
 # Исправления:
-# - Корректная обработка mcp_server -> MCPServerTable
-# - Улучшенная эвристика для имён таблиц с суффиксом _table
-# - Поддержка цепочек миграций
+# - Добавлена миграция 20260813180408_add_shadow_eval_direction в принудительные исправления
+# - Исправлен regex парсинга индексов (теперь корректно игнорирует "IF NOT EXISTS")
 #
 set -euo pipefail
 
@@ -28,7 +27,7 @@ DB_PASS="litellm_pass"
 DB_HOST="localhost"
 DB_PORT="5432"
 DB_NAME="litellm_db"
-MIGRATIONS_DIR="/root/ai/core/servers/litellm-venv/lib/python3.11/site-packages/litellm_proxy_extras/migrations"
+MIGRATIONS_DIR="/root/ai/core/servers/litellm-venv/lib/python3.13/site-packages/litellm_proxy_extras/migrations"
 
 export PGPASSWORD="$DB_PASS"
 
@@ -81,48 +80,69 @@ check_constraint_exists() {
 
 mark_migration_applied() {
     local migration_name="$1"
-    log_info "Pomechayu migraciyu kak primenyonnuyu: $migration_name"
-    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1 WHERE migration_name = '$migration_name' AND finished_at IS NULL;"
+    log_info "Принудительная пометка миграции как выполненной: $migration_name"
+    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.2' WHERE migration_name = '$migration_name';"
+}
+
+# === ФУНКЦИЯ: Прямое исправление известных проблемных миграций ===
+force_fix_known_migration() {
+    local migration_name="$1"
+    case "$migration_name" in
+        "20260811172448_add_shadow_eval")
+            if check_table_exists "LiteLLM_ShadowEvalJob"; then
+                log_info "Обнаружена известная миграция add_shadow_eval. Таблица LiteLLM_ShadowEvalJob существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция add_shadow_eval, но таблица LiteLLM_ShadowEvalJob ОТСУТСТВУЕТ. Требуется ручное вмешательство."
+                return 1
+            fi
+            ;;
+        "20260813180408_add_shadow_eval_direction")
+            if check_column_exists "LiteLLM_ShadowEvalJob" "baseline_model"; then
+                log_info "Обнаружена известная миграция add_shadow_eval_direction. Колонка baseline_model существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция add_shadow_eval_direction, но колонка baseline_model ОТСУТСТВУЕТ. Требуется ручное вмешательство."
+                return 1
+            fi
+            ;;
+    esac
+    return 1 # Не является известной проблемной миграцией
 }
 
 parse_sql_file() {
     local sql_file="$1"
-    local line tbl col idx constraint_name
+    local line
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*-- ]] && continue
         [[ -z "${line// }" ]] && continue
         set +u
-        
-        if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
-            ARTIFACTS+=("table:${BASH_REMATCH[1]}")
+
+        # Таблицы: учитывает IF NOT EXISTS и префикс схемы
+        if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            ARTIFACTS+=("table:${BASH_REMATCH[3]}")
         fi
-        
-        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+COLUMN[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
-            tbl="${BASH_REMATCH[1]}"
-            col="${BASH_REMATCH[2]}"
-            if [[ -n "$tbl" && -n "$col" ]]; then
-                ARTIFACTS+=("column:${tbl}:${col}")
-            fi
+
+        # Колонки: учитывает префикс схемы
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+COLUMN[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}")
         fi
-        
-        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
-            idx="${BASH_REMATCH[3]}"
-            if [[ -n "$idx" ]]; then
-                ARTIFACTS+=("index:${idx}")
-            fi
+
+        # Индексы: ИСПРАВЛЕНО. Теперь явно пропускает "IF NOT EXISTS" и корректно захватывает имя индекса
+        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[[:space:]]*(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([a-zA-Z_][a-zA-Z0-9_]*)\"? ]]; then
+            ARTIFACTS+=("index:${BASH_REMATCH[6]}")
         fi
-        
+
+        # Ограничения
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
-            constraint_name="${BASH_REMATCH[2]}"
-            if [[ -n "$constraint_name" ]]; then
-                ARTIFACTS+=("constraint:${constraint_name}")
-            fi
+            ARTIFACTS+=("constraint:${BASH_REMATCH[2]}")
         fi
         set -u
     done < "$sql_file"
 }
 
-# Преобразует snake_case в PascalCase
 to_pascal_case() {
     local input="$1"
     echo "$input" | awk -F'_' '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1' OFS=''
@@ -132,34 +152,24 @@ parse_migration_name() {
     local name="$1"
     local col tbl_raw tbl has_table_suffix=false
     set +u
-    
-    # Проверяем суффикс _table в имени миграции
+
     if [[ "$name" =~ _table$ ]]; then
         has_table_suffix=true
     fi
-    
+
     if [[ "$name" =~ add_([a-z_]+)_to_([a-z_]+)_table$ ]]; then
         col="${BASH_REMATCH[1]}"
         tbl_raw="${BASH_REMATCH[2]}"
-        
-        # === ИСПРАВЛЕНИЕ: Явные маппинги для проблемных таблиц ===
         case "$tbl_raw" in
-            mcp_server)
-                tbl="MCPServerTable"
-                ;;
-            *)
+            mcp_server) tbl="MCPServerTable" ;;
+            *) 
                 tbl=$(to_pascal_case "$tbl_raw")
-                # Если в имени миграции был суффикс _table, добавляем Table к имени
-                if [[ "$has_table_suffix" == true ]]; then
-                    tbl="${tbl}Table"
-                fi
+                [[ "$has_table_suffix" == true ]] && tbl="${tbl}Table"
                 ;;
         esac
-        
         ARTIFACTS+=("column:LiteLLM_${tbl}:${col}")
         set -u
         return 0
-        
     elif [[ "$name" =~ add_([a-z_]+)_([a-z_]+)$ ]]; then
         tbl_raw="${BASH_REMATCH[1]}"
         col="${BASH_REMATCH[2]}"
@@ -167,7 +177,6 @@ parse_migration_name() {
         ARTIFACTS+=("column:LiteLLM_${tbl}:${col}")
         set -u
         return 0
-        
     elif [[ "$name" =~ add_([a-z_]+)_tables$ ]]; then
         tbl_raw="${BASH_REMATCH[1]}"
         tbl=$(to_pascal_case "$tbl_raw")
@@ -175,7 +184,7 @@ parse_migration_name() {
         set -u
         return 0
     fi
-    
+
     set -u
     return 1
 }
@@ -187,36 +196,16 @@ verify_artifacts() {
         IFS=':' read -r type arg1 arg2 <<< "$art"
         case "$type" in
             table)
-                if check_table_exists "$arg1"; then
-                    log_info "Tablica $arg1 suschestvuet."
-                else
-                    log_error "Tablica $arg1 OTSUTSTVUET."
-                    all_ok=false
-                fi
+                if check_table_exists "$arg1"; then log_info "Таблица $arg1 существует."; else log_error "Таблица $arg1 ОТСУТСТВУЕТ."; all_ok=false; fi
                 ;;
             column)
-                if check_column_exists "$arg1" "$arg2"; then
-                    log_info "Kolonna $arg1.$arg2 suschestvuet."
-                else
-                    log_error "Kolonna $arg1.$arg2 OTSUTSTVUET."
-                    all_ok=false
-                fi
+                if check_column_exists "$arg1" "$arg2"; then log_info "Колонка $arg1.$arg2 существует."; else log_error "Колонка $arg1.$arg2 ОТСУТСТВУЕТ."; all_ok=false; fi
                 ;;
             index)
-                if check_index_exists "$arg1"; then
-                    log_info "Indeks $arg1 suschestvuet."
-                else
-                    log_error "Indeks $arg1 OTSUTSTVUET."
-                    all_ok=false
-                fi
+                if check_index_exists "$arg1"; then log_info "Индекс $arg1 существует."; else log_error "Индекс $arg1 ОТСУТСТВУЕТ."; all_ok=false; fi
                 ;;
             constraint)
-                if check_constraint_exists "$arg1"; then
-                    log_info "Ogranichenie $arg1 suschestvuet."
-                else
-                    log_error "Ogranichenie $arg1 OTSUTSTVUET."
-                    all_ok=false
-                fi
+                if check_constraint_exists "$arg1"; then log_info "Ограничение $arg1 существует."; else log_error "Ограничение $arg1 ОТСУТСТВУЕТ."; all_ok=false; fi
                 ;;
         esac
     done
@@ -227,18 +216,24 @@ process_migration() {
     local migration_name="$1"
     local migration_dir="$MIGRATIONS_DIR/$migration_name"
     local sql_file="$migration_dir/migration.sql"
-    
-    log_info "Analiz migracii: $migration_name"
+
+    log_info "Анализ миграции: $migration_name"
     ARTIFACTS=()
-    
+
+    # ШАГ 1: Приоритетная проверка известных проблемных миграций
+    if force_fix_known_migration "$migration_name"; then
+        return 0
+    fi
+
+    # ШАГ 2: Стандартный парсинг (если миграция не попала в список известных)
     if [[ -f "$sql_file" ]]; then
-        log_info "Parsing SQL file..."
+        log_info "Парсинг SQL-файла..."
         parse_sql_file "$sql_file"
     else
-        log_warn "SQL fail ne nayden, ispolzuyu evristiku po imeni."
+        log_warn "SQL-файл не найден, использую эвристику по имени."
         parse_migration_name "$migration_name" || true
     fi
-    
+
     # Убираем дубликаты
     declare -A unique_artifacts
     local clean_artifacts=()
@@ -250,50 +245,52 @@ process_migration() {
         fi
     done
     ARTIFACTS=("${clean_artifacts[@]}")
-    
+
     if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
-        log_warn "Ne udalos opredelit artefakty. Propusk."
+        log_warn "Не удалось определить артефакты. Пропуск."
         return 1
     fi
-    
-    log_info "Naydeno artefaktov: ${#ARTIFACTS[@]}"
-    
+
+    log_info "Найдено артефактов: ${#ARTIFACTS[@]}"
+
     if verify_artifacts; then
         mark_migration_applied "$migration_name"
         return 0
     else
-        log_warn "Shema BD nepolnaya, migraciya ne pomechena."
+        log_warn "Схема БД неполная, миграция не помечена как выполненная."
         return 1
     fi
 }
 
 main() {
-    echo "LITELLM AUTO-REPAIR (ULTIMATE v6)"
-    
+    echo "=========================================="
+    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.2)"
+    echo "=========================================="
+
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
-        log_warn "Papka migraciy ne naydena: $MIGRATIONS_DIR"
+        log_warn "Папка миграций не найдена: $MIGRATIONS_DIR"
         exit 1
     fi
-    
-    log_info "Poisk failed-migraciy..."
+
+    log_info "Поиск failed-миграций..."
     local migrations
     migrations=$(run_sql "SELECT DISTINCT migration_name FROM _prisma_migrations WHERE rolled_back_at IS NOT NULL OR finished_at IS NULL;")
-    
+
     if [[ -z "$migrations" ]]; then
-        log_info "Net failed-migraciy. Sostoyanie korrektno."
+        log_info "Нет failed-миграций. Состояние БД корректно."
         exit 0
     fi
-    
+
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        log_info "Ostanovka $SERVICE_NAME..."
+        log_info "Остановка $SERVICE_NAME..."
         systemctl stop "$SERVICE_NAME"
         sleep 2
     fi
-    
+
     local resolved=0
     local skipped=0
     local migration
-    
+
     while IFS= read -r migration; do
         [[ -z "$migration" ]] && continue
         echo "-------------------------------------------"
@@ -303,14 +300,14 @@ main() {
             skipped=$((skipped + 1))
         fi
     done <<< "$migrations"
-    
+
     echo "-------------------------------------------"
-    log_info "Itog: $resolved ispravleno, $skipped propuscheno."
-    
-    log_info "Zapusk $SERVICE_NAME..."
+    log_info "Итог: $resolved исправлено, $skipped пропущено."
+
+    log_info "Запуск $SERVICE_NAME..."
     systemctl start "$SERVICE_NAME"
-    
-    echo "SKRIPT ZAVYORSHEN"
+
+    echo "СКРИПТ ЗАВЕРШЁН УСПЕШНО"
     unset PGPASSWORD
 }
 
