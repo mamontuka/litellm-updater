@@ -14,10 +14,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org>.
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.2)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.5)
 # Исправления:
-# - Добавлена миграция 20260813180408_add_shadow_eval_direction в принудительные исправления
-# - Исправлен regex парсинга индексов (теперь корректно игнорирует "IF NOT EXISTS")
+# - Добавлена миграция 20260819000000_shadow_eval_max_budget в принудительные исправления
+# - Сохранена вся предыдущая логика и обратная совместимость
 #
 set -euo pipefail
 
@@ -81,7 +81,7 @@ check_constraint_exists() {
 mark_migration_applied() {
     local migration_name="$1"
     log_info "Принудительная пометка миграции как выполненной: $migration_name"
-    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.2' WHERE migration_name = '$migration_name';"
+    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.5' WHERE migration_name = '$migration_name';"
 }
 
 # === ФУНКЦИЯ: Прямое исправление известных проблемных миграций ===
@@ -94,7 +94,7 @@ force_fix_known_migration() {
                 mark_migration_applied "$migration_name"
                 return 0
             else
-                log_warn "Миграция add_shadow_eval, но таблица LiteLLM_ShadowEvalJob ОТСУТСТВУЕТ. Требуется ручное вмешательство."
+                log_warn "Миграция add_shadow_eval, но таблица LiteLLM_ShadowEvalJob ОТСУТСТВУЕТ."
                 return 1
             fi
             ;;
@@ -104,7 +104,37 @@ force_fix_known_migration() {
                 mark_migration_applied "$migration_name"
                 return 0
             else
-                log_warn "Миграция add_shadow_eval_direction, но колонка baseline_model ОТСУТСТВУЕТ. Требуется ручное вмешательство."
+                log_warn "Миграция add_shadow_eval_direction, но колонка baseline_model ОТСУТСТВУЕТ."
+                return 1
+            fi
+            ;;
+        "20260817143646_add_daily_guardrail_usage_units")
+            if check_table_exists "LiteLLM_DailyGuardrailUsageUnits"; then
+                log_info "Обнаружена известная миграция add_daily_guardrail_usage_units. Таблица существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция add_daily_guardrail_usage_units, но таблица ОТСУТСТВУЕТ."
+                return 1
+            fi
+            ;;
+        "20260818224500_add_shadow_eval_stopped_by")
+            if check_column_exists "LiteLLM_ShadowEvalJob" "stopped_by"; then
+                log_info "Обнаружена известная миграция add_shadow_eval_stopped_by. Колонка stopped_by существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция add_shadow_eval_stopped_by, но колонка stopped_by ОТСУТСТВУЕТ."
+                return 1
+            fi
+            ;;
+        "20260819000000_shadow_eval_max_budget")
+            if check_column_exists "LiteLLM_ShadowEvalJob" "max_budget"; then
+                log_info "Обнаружена известная миграция shadow_eval_max_budget. Колонка max_budget существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция shadow_eval_max_budget, но колонка max_budget ОТСУТСТВУЕТ."
                 return 1
             fi
             ;;
@@ -120,22 +150,18 @@ parse_sql_file() {
         [[ -z "${line// }" ]] && continue
         set +u
 
-        # Таблицы: учитывает IF NOT EXISTS и префикс схемы
         if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("table:${BASH_REMATCH[3]}")
         fi
 
-        # Колонки: учитывает префикс схемы
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+COLUMN[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}")
         fi
 
-        # Индексы: ИСПРАВЛЕНО. Теперь явно пропускает "IF NOT EXISTS" и корректно захватывает имя индекса
         if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[[:space:]]*(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([a-zA-Z_][a-zA-Z0-9_]*)\"? ]]; then
             ARTIFACTS+=("index:${BASH_REMATCH[6]}")
         fi
 
-        # Ограничения
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("constraint:${BASH_REMATCH[2]}")
         fi
@@ -264,7 +290,7 @@ process_migration() {
 
 main() {
     echo "=========================================="
-    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.2)"
+    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.5)"
     echo "=========================================="
 
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
