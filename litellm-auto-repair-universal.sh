@@ -14,10 +14,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org>.
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.5)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.6)
 # Исправления:
-# - Добавлена миграция 20260819000000_shadow_eval_max_budget в принудительные исправления
-# - Сохранена вся предыдущая логика и обратная совместимость
+# - Добавлена поддержка парсинга операций RENAME TABLE и RENAME COLUMN
+# - Добавлена миграция 20261001100000_rename_lens в принудительные исправления (как страховка)
 #
 set -euo pipefail
 
@@ -81,7 +81,7 @@ check_constraint_exists() {
 mark_migration_applied() {
     local migration_name="$1"
     log_info "Принудительная пометка миграции как выполненной: $migration_name"
-    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.5' WHERE migration_name = '$migration_name';"
+    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.6' WHERE migration_name = '$migration_name';"
 }
 
 # === ФУНКЦИЯ: Прямое исправление известных проблемных миграций ===
@@ -138,6 +138,18 @@ force_fix_known_migration() {
                 return 1
             fi
             ;;
+        "20261001100000_rename_lens")
+            # Для миграций переименования проверяем наличие наиболее вероятного целевого объекта.
+            # Если парсинг SQL сработает, этот блок не понадобится, но он служит надежной страховкой.
+            if check_table_exists "LiteLLM_Lens" || check_table_exists "LiteLLM_LensTable"; then
+                log_info "Обнаружена миграция rename_lens. Целевая таблица Lens существует."
+                mark_migration_applied "$migration_name"
+                return 0
+            else
+                log_warn "Миграция rename_lens, но таблицы Lens не найдено. Требуется ручной анализ SQL-файла."
+                return 1
+            fi
+            ;;
     esac
     return 1 # Не является известной проблемной миграцией
 }
@@ -150,18 +162,32 @@ parse_sql_file() {
         [[ -z "${line// }" ]] && continue
         set +u
 
+        # 1. Создание таблиц
         if [[ "$line" =~ CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("table:${BASH_REMATCH[3]}")
         fi
 
+        # 2. Добавление колонок
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+COLUMN[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}")
         fi
 
+        # 3. Переименование таблиц (НОВОЕ)
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+RENAME[[:space:]]+TO[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            ARTIFACTS+=("table:${BASH_REMATCH[3]}") # Проверяем наличие НОВОГО имени таблицы
+        fi
+
+        # 4. Переименование колонок (НОВОЕ)
+        if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+RENAME[[:space:]]+COLUMN[[:space:]]+\"?[a-zA-Z_][a-zA-Z0-9_]*\"?[[:space:]]+TO[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
+            ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[4]}") # Проверяем наличие колонки с НОВЫМ именем
+        fi
+
+        # 5. Создание индексов
         if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[[:space:]]*(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([a-zA-Z_][a-zA-Z0-9_]*)\"? ]]; then
             ARTIFACTS+=("index:${BASH_REMATCH[6]}")
         fi
 
+        # 6. Добавление ограничений
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+ADD[[:space:]]+CONSTRAINT[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("constraint:${BASH_REMATCH[2]}")
         fi
@@ -290,7 +316,7 @@ process_migration() {
 
 main() {
     echo "=========================================="
-    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.5)"
+    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.6)"
     echo "=========================================="
 
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
