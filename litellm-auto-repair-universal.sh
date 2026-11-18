@@ -14,10 +14,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org>.
 #
-# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.6)
+# LiteLLM Auto-Repair Script (ULTIMATE VERSION - FIXED v7.7)
 # Исправления:
-# - Добавлена поддержка парсинга операций RENAME TABLE и RENAME COLUMN
-# - Добавлена миграция 20261001100000_rename_lens в принудительные исправления (как страховка)
+# - Исправлен баг в оригинальном regex для индексов (BASH_REMATCH[6] -> [5]), который вызывал ошибку "Индекс ОТСУТСТВУЕТ" с пустым именем.
+# - Добавлена функция force_fix_spendlog_delivery для принудительного создания колонки 'state' в LiteLLM_SpendLogDelivery.
+# - Добавлены миграции 20261001100000_rename_lens, 20261027000000_add_accounting_ledger_tables и 20261103010000_spendlogs_accounting_delivery в принудительные исправления.
 #
 set -euo pipefail
 
@@ -81,7 +82,37 @@ check_constraint_exists() {
 mark_migration_applied() {
     local migration_name="$1"
     log_info "Принудительная пометка миграции как выполненной: $migration_name"
-    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.6' WHERE migration_name = '$migration_name';"
+    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.14' WHERE migration_name = '$migration_name';"
+}
+
+# === НОВАЯ ФУНКЦИЯ: Принудительное исправление для SpendLogDelivery ===
+force_fix_spendlog_delivery() {
+    log_info "ПРИНУДИТЕЛЬНОЕ ИСПРАВЛЕНИЕ: Проверка таблицы LiteLLM_SpendLogDelivery и колонки 'state'..."
+
+    local target_table="LiteLLM_SpendLogDelivery"
+
+    if check_table_exists "$target_table"; then
+        log_info "Таблица $target_table найдена."
+
+        local col_exists
+        col_exists=$(run_sql "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = '$target_table' AND column_name = 'state';")
+
+        if [[ "$col_exists" -eq 0 ]]; then
+            log_info "Колонка 'state' отсутствует. Добавляем её вручную..."
+            psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "ALTER TABLE \"$target_table\" ADD COLUMN IF NOT EXISTS state TEXT;" >/dev/null 2>&1
+            log_info "Колонка 'state' успешно добавлена в $target_table."
+        else
+            log_info "Колонка 'state' уже существует в $target_table."
+        fi
+
+        # Принудительно фиксируем обе связанные миграции
+        mark_migration_applied "20261027000000_add_accounting_ledger_tables"
+        mark_migration_applied "20261103010000_spendlogs_accounting_delivery"
+        return 0
+    else
+        log_error "Таблица $target_table не найдена в БД. Проверьте структуру базы вручную."
+        return 1
+    fi
 }
 
 # === ФУНКЦИЯ: Прямое исправление известных проблемных миграций ===
@@ -150,6 +181,10 @@ force_fix_known_migration() {
                 return 1
             fi
             ;;
+        "20261027000000_add_accounting_ledger_tables" | "20261103010000_spendlogs_accounting_delivery")
+            force_fix_spendlog_delivery
+            return $?
+            ;;
     esac
     return 1 # Не является известной проблемной миграцией
 }
@@ -172,19 +207,19 @@ parse_sql_file() {
             ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}")
         fi
 
-        # 3. Переименование таблиц (НОВОЕ)
+        # 3. Переименование таблиц
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+RENAME[[:space:]]+TO[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("table:${BASH_REMATCH[3]}") # Проверяем наличие НОВОГО имени таблицы
         fi
 
-        # 4. Переименование колонок (НОВОЕ)
+        # 4. Переименование колонок
         if [[ "$line" =~ ALTER[[:space:]]+TABLE[[:space:]]+(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?[[:space:]]+RENAME[[:space:]]+COLUMN[[:space:]]+\"?[a-zA-Z_][a-zA-Z0-9_]*\"?[[:space:]]+TO[[:space:]]+\"?([A-Za-z_][A-Za-z0-9_]*)\"? ]]; then
             ARTIFACTS+=("column:${BASH_REMATCH[2]}:${BASH_REMATCH[4]}") # Проверяем наличие колонки с НОВЫМ именем
         fi
 
-        # 5. Создание индексов
-        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[[:space:]]*(\"?[a-zA-Z_][a-zA-Z0-9_]*\"?\.)?\"?([a-zA-Z_][a-zA-Z0-9_]*)\"? ]]; then
-            ARTIFACTS+=("index:${BASH_REMATCH[6]}")
+        # 5. Создание индексов (ИСПРАВЛЕНО: BASH_REMATCH[6] заменён на [5], так как в оригинале группа 6 была пустой, что вызывало ошибку "Индекс ОТСУТСТВУЕТ")
+        if [[ "$line" =~ CREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX[[:space:]]+(CONCURRENTLY[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[[:space:]]*\"?([a-zA-Z_][a-zA-Z0-9_]*)\"?[[:space:]]+ON ]]; then
+            ARTIFACTS+=("index:${BASH_REMATCH[5]}")
         fi
 
         # 6. Добавление ограничений
@@ -214,7 +249,7 @@ parse_migration_name() {
         tbl_raw="${BASH_REMATCH[2]}"
         case "$tbl_raw" in
             mcp_server) tbl="MCPServerTable" ;;
-            *) 
+            *)
                 tbl=$(to_pascal_case "$tbl_raw")
                 [[ "$has_table_suffix" == true ]] && tbl="${tbl}Table"
                 ;;
@@ -316,7 +351,7 @@ process_migration() {
 
 main() {
     echo "=========================================="
-    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.6)"
+    echo " LITELLM AUTO-REPAIR (ULTIMATE v7.7)"
     echo "=========================================="
 
     if [[ ! -d "$MIGRATIONS_DIR" ]]; then
