@@ -82,7 +82,7 @@ check_constraint_exists() {
 mark_migration_applied() {
     local migration_name="$1"
     log_info "Принудительная пометка миграции как выполненной: $migration_name"
-    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.14' WHERE migration_name = '$migration_name';"
+    run_sql "UPDATE _prisma_migrations SET finished_at = NOW(), rolled_back_at = NULL, applied_steps_count = 1, logs = 'Force fixed by auto-repair v7.7' WHERE migration_name = '$migration_name';"
 }
 
 # === НОВАЯ ФУНКЦИЯ: Принудительное исправление для SpendLogDelivery ===
